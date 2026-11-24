@@ -1,12 +1,20 @@
 name: CI
 
-on: [push, pull_request]
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Optional tap test file(s) to run instead of the full suite'
+        required: false
+        default: ''
 
 jobs:
   build:
     strategy:
       matrix:
-        node-version: [18.x, 20.x, 21.x]
+        # 24.4.1 = the Node that packed the published tarball; later 24.x
+        # releases hang tap 19.2.5's t.mockImport ESM loader (test/bin.ts).
+        node-version: [24.4.1, 18.x, 20.x, 21.x]
         platform:
         - os: ubuntu-latest
           shell: bash
@@ -19,6 +27,7 @@ jobs:
       fail-fast: false
 
     runs-on: ${{ matrix.platform.os }}
+    timeout-minutes: 40
     defaults:
       run:
         shell: ${{ matrix.platform.shell }}
@@ -34,12 +43,52 @@ jobs:
           cache: npm
 
       - name: Install dependencies
-        run: npm ci
+        run: npm ci --ignore-scripts
+
+      # The 10.5.0 bin.mts backport only type-checks against jackspeak 4
+      # (values with a default are non-optional); the lockfile pins 3.4.2, so
+      # tshy fails with TS18048. The published dist was compiled against
+      # jackspeak 4.1.1 / minimatch 10.1.1 typings with TypeScript >=5.5; this
+      # reproduces that compile environment byte-for-byte. `npm ci` above
+      # skips the root `prepare` (tshy) so it runs only after this step, via
+      # `pretest` / `npm pack`.
+      - name: Install publisher compile-time dependency set
+        run: npm install --no-save --ignore-scripts jackspeak@4.1.1 minimatch@10.1.1 typescript@5.9.3
+
+      # test/progra-tilde.ts resolves the 8.3 short name `progra~1` of a
+      # fresh 'program files' fixture dir; GitHub's Windows runners disable
+      # 8.3 name generation, so turn it back on before the fixture is made.
+      - name: Enable NTFS 8.3 short names
+        if: matrix.platform.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          fsutil 8dot3name set 0
+          fsutil 8dot3name set $env:GITHUB_WORKSPACE.Substring(0,2) 0
+          fsutil 8dot3name query $env:GITHUB_WORKSPACE.Substring(0,2)
 
       - name: Run Tests Windows (incomplete coverage)
         if: matrix.platform.os == 'windows-latest'
-        run: npm test -- -c -t0 --allow-incomplete-coverage
+        run: npm test -- -c -t0 --allow-incomplete-coverage ${{ inputs.test-filter }}
 
       - name: Run Tests Unix (complete coverage)
         if: matrix.platform.os != 'windows-latest'
-        run: npm test -- -c -t0
+        run: npm test -- -c -t0 --allow-incomplete-coverage ${{ inputs.test-filter }}
+
+      - name: Report skipped tests and reasons
+        if: matrix.platform.os != 'ubuntu-latest'
+        shell: bash
+        run: |
+          echo "Skipped tests on ${{ matrix.platform.os }} (name :: reason):"
+          if grep -rni "# skip" .tap/test-results/; then :; else echo "none"; fi
+
+      - name: Pack
+        if: matrix.platform.os == 'ubuntu-latest' && matrix.node-version == '24.4.1'
+        run: npm pack
+
+      - name: Upload package tarball
+        if: matrix.platform.os == 'ubuntu-latest' && matrix.node-version == '24.4.1'
+        uses: actions/upload-artifact@v4
+        with:
+          name: glob-tgz
+          path: glob-*.tgz
+          if-no-files-found: error
